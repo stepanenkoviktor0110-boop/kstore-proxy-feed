@@ -1,5 +1,12 @@
 // Proxy-feed для Kstore — обогащает <description> карточек разговорными синонимами,
 // чтобы B24U-поиск возвращал товары на формулировки, не совпадающие с <name>.
+//
+// v3 (2026-05-14): полный фид, без выборки 100. Тариф B24U поднят с Demo на платный
+// без лимита товаров. Buckets/filter/picks/filler удалены — теперь обогащаем ВСЕ
+// карточки исходного фида и отдаём как есть. Дедуп Bitrix-блоков и обрезка
+// description до 850 знаков сохранены: каждая карточка должна укладываться в один
+// chunk B24U (~900 знаков), иначе обогащение нарезается на куски и теряет смысл.
+//
 // SOURCE_FEED_URL=https://kstore.ru/bitrix/catalog_export/export_0fM.xml
 
 import { XMLParser, XMLBuilder } from 'fast-xml-parser';
@@ -8,35 +15,6 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 const SOURCE_FEED_URL = process.env.SOURCE_FEED_URL
   || 'https://kstore.ru/bitrix/catalog_export/export_0fM.xml';
 const OUT_PATH = 'public/feed.xml';
-
-// На демо-тарифе B24U лимит 100 товаров. Берём из ~2500 ассортимента по чуть-чуть
-// из ключевых категорий И с разбросом по цене (низ/середина/верх), чтобы бот
-// мог отвечать на запросы вида «есть наушники беспроводные», «смартфон до 50 000»,
-// «недорогой повербанк», «электровелосипед», «робот-пылесос».
-// ВАЖНО: порядок имеет значение — более узкие категории идут ПЕРВЫМИ,
-// иначе чехлы для iPhone провалятся в bucket «iphone-смартфоны» (т.к. в name есть «iPhone 13»).
-const CATEGORY_BUCKETS = [
-  { name: 'чехлы-iphone', re: /^чехол|накладка.*iphone/i, picks: 6, budgetSpread: true },
-  { name: 'защитное-стекло-плёнка', re: /(защитн.*стекл|защитн.*пленк|hydrogel)/i, picks: 4, budgetSpread: true },
-  { name: 'ремешки-часов', re: /ремешок.*(watch|часов|apple watch)/i, picks: 4, budgetSpread: true },
-  { name: 'iphone-смартфоны', re: /^apple iphone|^iphone \d/i, picks: 4, budgetSpread: true },
-  { name: 'android-смартфоны', re: /смартфон.*(samsung|xiaomi|poco|redmi|honor|huawei|pixel|google|techno|infinix)/i, picks: 6, budgetSpread: true },
-  { name: 'apple-watch-и-часы', re: /(apple watch|watch (se|series|ultra)|умные часы|smart watch|fitness band|фитнес.?браслет|amazfit|mi band|honor band)/i, picks: 6, budgetSpread: true },
-  { name: 'наушники-беспроводные', re: /(беспровод|wireless|bluetooth|airpods|tws|marshall).*наушник|наушник.*(беспровод|wireless|bluetooth|tws)|airpods|накладн.*наушник.*marshall/i, picks: 6, budgetSpread: true },
-  { name: 'наушники-проводные', re: /проводн.*наушник|наушник.*проводн|jack 3\.?5/i, picks: 4, budgetSpread: true },
-  { name: 'умный-дом', re: /(умн.*(лампочк|розетк|чайник|выключател|освещен|колонк)|smart.*(bulb|plug|kettle|switch|light)|датчик.*(температур|влажн|микроклимат|открыт|движен|двер)|очистител.*воздух|увлажнител.*воздух|yeelight|aqara|mi home|qcooker|petkit)/i, picks: 8, budgetSpread: true },
-  { name: 'пылесосы', re: /(робот.*пылесос|вертикальн.*пылесос|ручн.*пылесос|пылесос|vacuum|roidmi|roborock|mi.?vacuum|dreame|dyson)/i, picks: 6, budgetSpread: true },
-  { name: 'электротранспорт-велосипеды', re: /(электровелосипед|e.?bike|электро.?байк)/i, picks: 4, budgetSpread: true },
-  { name: 'электротранспорт-самокаты', re: /(электросамокат|e.?scooter|самокат.*электр|ninebot|segway)/i, picks: 4, budgetSpread: true },
-  { name: 'квадрокоптеры-vr', re: /(квадрокоптер|drone|dji|vr.?очки|meta.*quest|vr.?шлем|oculus|playstation vr)/i, picks: 4, budgetSpread: true },
-  { name: 'тв-проекторы', re: /(телевизор|smart.?tv|проектор|projector|медиаплеер|tv.box)/i, picks: 4, budgetSpread: true },
-  { name: 'кабели-зарядки-повербанки', re: /(кабель|зарядк|power.?bank|повербанк|внешн.*аккумул|charger|адаптер.*питан|usb.?хаб)/i, picks: 8, budgetSpread: true },
-  { name: 'красота-здоровье', re: /(фен|hair.?dryer|стайлер|триммер|эпилятор|массажёр|массажер|massager|shaver|зубн.*щётк|выпрямител.*волос|плойка)/i, picks: 6, budgetSpread: true },
-  { name: 'геймпады-приставки', re: /(геймпад|gamepad|controller|консоль|playstation|xbox|nintendo|джойстик)/i, picks: 4, budgetSpread: true },
-  { name: 'аксессуары-разное', re: /(гирлянд|крепление|подставка|чехол.*macbook|чехол.*ipad|чехол.*airpods)/i, picks: 6, budgetSpread: true },
-];
-const FILTER_ENABLED = process.env.FILTER === '0' ? false : true;
-const PRICE_BUCKETS = ['low', 'mid', 'high']; // равные слоты на price-spread
 
 // ───── Словари для Kstore (электроника, гаджеты, электротранспорт) ──────────
 
@@ -103,8 +81,8 @@ const NAME_PATTERNS = [
     add: 'электросамокат электрический самокат e-scooter ninebot xiaomi kugoo' },
   { re: /электротрицикл|cargo.*electric|грузов.*электр/i,
     add: 'грузовой электротрицикл электрическая грузовая тележка для перевозок rutrike' },
-  { re: /(самокат|велосипед|байк).*(не.?электро|обычн|складн)/i,
-    add: 'обычный самокат складной для города детский подростковый взрослый' },
+  { re: /(самокат|велосипед|байк).*(не.?электро|обычн|складн|трюков|детск|kick)/i,
+    add: 'обычный самокат складной для города детский подростковый взрослый трюковый kickscooter' },
 
   // Игровые
   { re: /геймпад|gamepad|controller/i,
@@ -128,12 +106,6 @@ const NAME_PATTERNS = [
   { re: /(проектор|projector)/i,
     add: 'домашний кинопроектор переносной портативный led 4k mi xiaomi' },
 ];
-
-// Сопоставление по категории (берётся из <categoryId> или path).
-const CATEGORY_HINTS = {
-  // Используется если в name недостаточно слов — добавляем из категории.
-  // Заполняется после первого прохода: я не знаю реальную category-tree Kstore.
-};
 
 // Бренды — пишем как доп. синонимы, чтобы запросы «есть samsung?» находили нужные.
 const BRAND_SYNONYMS = {
@@ -163,9 +135,22 @@ function appendUnique(description, addition) {
   if (!addition) return description;
   const desc = String(description ?? '').trim();
   const lcDesc = desc.toLowerCase();
-  // не дублируем целиком уже существующее
   if (lcDesc.includes(addition.slice(0, 40).toLowerCase())) return desc;
   return desc ? `${desc}. ${addition}` : addition;
+}
+
+function priceZoneSyn(p) {
+  if (!p) return '';
+  if (p < 1000)    return 'дешевле тысячи до 1000 руб бюджетный';
+  if (p < 3000)    return 'до 3000 руб до трёх тысяч недорогой бюджетный';
+  if (p < 5000)    return 'до 5000 руб до пяти тысяч недорогой';
+  if (p < 10000)   return 'до 10000 руб до десяти тысяч средний бюджет';
+  if (p < 20000)   return 'до 20000 руб до двадцати тысяч средний';
+  if (p < 30000)   return 'до 30000 руб до тридцати тысяч средний бюджет';
+  if (p < 50000)   return 'до 50000 руб до пятидесяти тысяч';
+  if (p < 80000)   return 'до 80000 руб до восьмидесяти тысяч премиум';
+  if (p < 100000)  return 'до 100000 руб до ста тысяч премиум флагман';
+  return 'от 100000 руб премиум топовый флагман дорогой';
 }
 
 function enrichDescription(offer) {
@@ -173,7 +158,6 @@ function enrichDescription(offer) {
   let desc = String(offer['description'] ?? '').trim();
 
   // Удаляем дублирующийся блок (фид Kstore содержит content × 2 — раздувает chunks).
-  // Эвристика: если description начинается с того же текста, что и vendor + name — обрезаем хвостовой дубль.
   const firstSentence = desc.split(/[.!?\n]/)[0];
   if (firstSentence && firstSentence.length > 20) {
     const secondOccurrence = desc.indexOf(firstSentence, firstSentence.length);
@@ -182,19 +166,20 @@ function enrichDescription(offer) {
     }
   }
 
-  // Синонимы по name
   const additions = [];
   for (const pat of NAME_PATTERNS) {
     if (pat.re.test(name)) additions.push(pat.add);
   }
 
-  // Бренд
   const vendor = String(offer['vendor'] ?? '').toLowerCase().trim();
   if (vendor && BRAND_SYNONYMS[vendor]) {
     additions.push(BRAND_SYNONYMS[vendor]);
   }
 
-  // Цвет, объём памяти, диагональ — приоритетные структурные поля для поиска
+  const priceRaw = parseInt(String(offer['price'] ?? '0').replace(/[^\d]/g, ''), 10);
+  const zone = priceZoneSyn(priceRaw);
+  if (zone) additions.push(zone);
+
   const param = offer['param'];
   if (Array.isArray(param)) {
     for (const p of param) {
@@ -208,14 +193,12 @@ function enrichDescription(offer) {
     }
   }
 
-  // Удалим из desc телефон менеджера если он там есть — у нас он в Контактах
   desc = desc.replace(/По вопросам заказа звоните:\s*8\s*\(800\)\s*551-?26-?10\s*!?/gi, '').trim();
 
   for (const add of additions) {
     desc = appendUnique(desc, add);
   }
 
-  // chunks B24U ~900 знаков. Жёстко режем при превышении 850 чтоб не потерять синонимы.
   if (desc.length > 850) {
     desc = desc.slice(0, 850).replace(/[.,;]\s*\S*$/, '').trim();
   }
@@ -244,78 +227,11 @@ const builder = new XMLBuilder({
 
 const feed = parser.parse(xml);
 
-const allOffers = feed?.yml_catalog?.shop?.offers?.offer ?? [];
-
-// Фильтр: отобрать 100 товаров по категориям × ценовым слотам.
-// Каждая категория = bucket; внутри bucket берём `picks` товаров с равномерным
-// разбросом по price (если budgetSpread=true), иначе просто первые `picks`.
-function priceOf(o) {
-  const p = parseInt(String(o['price'] ?? '0').replace(/[^\d]/g, ''), 10);
-  return Number.isFinite(p) ? p : 0;
-}
-
-function pickFromBucket(bucket, name) {
-  if (!bucket.budgetSpread || bucket.length <= bucket.picks) {
-    return bucket.slice(0, bucket.picks);
-  }
-  bucket.sort((a, b) => priceOf(a) - priceOf(b));
-  const result = [];
-  const n = bucket.picks;
-  // Равномерное распределение по индексам: low (1/n), mid (k/n), high ((n-1)/n)
-  for (let i = 0; i < n; i++) {
-    const idx = Math.round((i + 0.5) / n * (bucket.length - 1));
-    if (!result.includes(bucket[idx])) result.push(bucket[idx]);
-  }
-  return result.slice(0, n);
-}
-
-let offers;
-if (FILTER_ENABLED) {
-  const buckets = CATEGORY_BUCKETS.map((c) => ({ ...c, items: [] }));
-  const used = new Set();
-  for (const o of allOffers) {
-    const name = String(o['name'] ?? '');
-    for (const b of buckets) {
-      if (b.re.test(name)) {
-        b.items.push(o);
-        used.add(o);
-        break;
-      }
-    }
-  }
-  // Picks per bucket
-  const picked = [];
-  const log = [];
-  for (const b of buckets) {
-    const arr = b.items;
-    arr.picks = b.picks;
-    arr.budgetSpread = b.budgetSpread;
-    const slice = pickFromBucket(arr, b.name);
-    picked.push(...slice);
-    log.push(`  ${b.name}: ${arr.length} found → ${slice.length} picked${slice.length ? ` (price ${priceOf(slice[0])}–${priceOf(slice[slice.length-1])} ₽)` : ''}`);
-  }
-  console.log('Category filter:');
-  console.log(log.join('\n'));
-  // Если общее <100 — добиваем оставшимися товарами с самой популярной price-зоной
-  if (picked.length < 100) {
-    const left = allOffers.filter(o => !used.has(o));
-    left.sort((a, b) => priceOf(a) - priceOf(b));
-    const need = 100 - picked.length;
-    // равномерный спред
-    for (let i = 0; i < need && i < left.length; i++) {
-      const idx = Math.round((i + 0.5) / need * (left.length - 1));
-      if (!picked.includes(left[idx])) picked.push(left[idx]);
-    }
-    console.log(`  + filler: ${Math.min(need, left.length)} from remaining ${left.length}`);
-  }
-  offers = picked.slice(0, 100);
-  feed.yml_catalog.shop.offers.offer = offers;
-} else {
-  offers = allOffers;
-}
+const offers = feed?.yml_catalog?.shop?.offers?.offer ?? [];
 
 let touched = 0;
 let totalLen = 0;
+let overlong = 0;
 for (const offer of offers) {
   const before = offer['description'];
   const after = enrichDescription(offer);
@@ -324,6 +240,7 @@ for (const offer of offers) {
     touched++;
   }
   totalLen += String(after ?? '').length;
+  if (String(after ?? '').length >= 850) overlong++;
 }
 
 mkdirSync('public', { recursive: true });
@@ -331,6 +248,6 @@ writeFileSync(OUT_PATH, builder.build(feed), 'utf-8');
 
 console.log(
   `Done. Offers total: ${offers.length}, enriched: ${touched}, ` +
-  `avg description: ${Math.round(totalLen / Math.max(offers.length, 1))} chars. ` +
-  `Written to ${OUT_PATH}`
+  `avg description: ${Math.round(totalLen / Math.max(offers.length, 1))} chars, ` +
+  `at-cap (≥850): ${overlong}. Written to ${OUT_PATH}`
 );
